@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -50,7 +51,7 @@ def login_required(f):
 # -------------------------------------------------------------------
 @app.route('/api/auth/register', methods=['POST'])
 def register():
-    """Registra um novo usuário no Auth e na tabela pública do banco."""
+    """Registra um novo usuário usando a trigger automática do Supabase."""
     data = request.get_json() or {}
     email = data.get('email')
     password = data.get('password')
@@ -64,10 +65,16 @@ def register():
         return jsonify({"erro": "Perfil deve ser estritamente 'Aluno' ou 'Professor'"}), 400
 
     try:
-        # Cria o usuário no sistema de autenticação do Supabase
+        # Cria o usuário no Auth - a trigger vai criar na tabela usuarios
         auth_response = supabase.auth.sign_up({
             "email": email,
-            "password": password
+            "password": password,
+            "options": {
+                "data": {
+                    "nome": nome,
+                    "perfil": perfil
+                }
+            }
         })
         
         if not auth_response.user:
@@ -75,17 +82,28 @@ def register():
             
         user_id = auth_response.user.id
 
-        # Insere os metadados do usuário na tabela do banco relacional
-        supabase.table("usuarios").insert({
-            "id_usuario": user_id,
-            "nome": nome,
-            "email": email,
-            "perfil": perfil,
-            "criado_em": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        }).execute()
+        # Aguarda a trigger criar o registro (pequeno delay)
+        time.sleep(0.5)
 
-        return jsonify({"mensagem": "Usuário criado com sucesso", "user_id": user_id}), 201
+        # Verifica se o registro foi criado
+        user_check = supabase.table("usuarios").select("*").eq("id_usuario", user_id).execute()
+        if not user_check.data:
+            # Fallback: insere manualmente se a trigger falhar
+            supabase.table("usuarios").insert({
+                "id_usuario": user_id,
+                "nome": nome,
+                "email": email,
+                "perfil": perfil,
+                "criado_em": datetime.utcnow().isoformat()
+            }).execute()
+
+        return jsonify({
+            "mensagem": "Usuário criado com sucesso",
+            "user_id": user_id
+        }), 201
+        
     except Exception as e:
+        print(f"❌ Erro no registro: {str(e)}")
         return jsonify({"erro": "Erro ao registrar usuário", "detalhes": str(e)}), 500
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -103,12 +121,45 @@ def login():
             "email": email,
             "password": password
         })
+        
+        if not auth_response.user:
+            return jsonify({"erro": "Usuário não encontrado"}), 401
+            
+        # Verifica se o registro existe na tabela usuarios
+        user_check = supabase.table("usuarios")\
+            .select("id_usuario, perfil, nome")\
+            .eq("id_usuario", auth_response.user.id)\
+            .execute()
+            
+        if not user_check.data:
+            # Tenta criar o registro manualmente (fallback)
+            try:
+                supabase.table("usuarios").insert({
+                    "id_usuario": auth_response.user.id,
+                    "nome": auth_response.user.email,
+                    "email": auth_response.user.email,
+                    "perfil": "Aluno",
+                    "criado_em": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                print(f"⚠️ Falha ao criar registro fallback: {e}")
+                return jsonify({
+                    "erro": "Perfil não encontrado",
+                    "detalhes": "Entre em contato com o suporte"
+                }), 403
+        
         return jsonify({
             "access_token": auth_response.session.access_token,
-            "user_id": auth_response.user.id
+            "user_id": auth_response.user.id,
+            "perfil": user_check.data[0]['perfil'] if user_check.data else "Aluno"
         }), 200
+        
     except Exception as e:
-        return jsonify({"erro": "Credenciais inválidas ou incorretas"}), 401
+        print(f"❌ Erro no login: {str(e)}")
+        return jsonify({
+            "erro": "Credenciais inválidas ou incorretas",
+            "detalhes": str(e)
+        }), 401
 
 # -------------------------------------------------------------------
 # Perfil do Usuário
